@@ -41,7 +41,7 @@ No other dependencies are needed — everything else is fetched automatically by
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/yourname/StockShark
+git clone https://github.com/TomH-2004/StockShark
 cd StockShark
 
 # 2. (Optional) Add an opening book — see "Opening Book" section below
