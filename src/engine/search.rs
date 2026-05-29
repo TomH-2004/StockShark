@@ -4,12 +4,10 @@ use std::time::Instant;
 
 use crate::board::position::{Move, Position};
 use crate::engine::eval::{evaluate, DRAW_SCORE, MATE_SCORE};
+use crate::engine::tt::{TranspositionTable, TtFlag};
 use crate::moves::generator::MoveGen;
 use crate::moves::make_move::{make_move, unmake_move};
 
-/// Penalty (in centipawns, from the side-to-move's perspective) for accepting a draw
-/// by repetition. A winning engine treats draws as slightly bad; a losing engine would
-/// prefer a draw, but that's handled by the normal search returning negative scores anyway.
 const CONTEMPT: i32 = -25;
 
 pub struct SearchResult {
@@ -23,13 +21,10 @@ pub struct SearchResult {
 pub struct Engine {
     pub stop: Arc<AtomicBool>,
     nodes: u64,
-    /// Killer moves: [depth][slot]
     killers: [[Move; 2]; 64],
-    /// History heuristic: [from][to]
     history: [[i32; 64]; 64],
-    /// Zobrist hashes of all positions played in the actual game before this search.
-    /// The search uses this to detect repetitions against the real game history.
     pub game_history: Vec<u64>,
+    pub tt: TranspositionTable,
 }
 
 impl Engine {
@@ -40,6 +35,7 @@ impl Engine {
             killers: [[Move::default(); 2]; 64],
             history: [[0; 64]; 64],
             game_history: Vec::new(),
+            tt: TranspositionTable::new(16),
         }
     }
 
@@ -55,9 +51,6 @@ impl Engine {
         let mut best_score = -MATE_SCORE;
         let mut pv = Vec::new();
 
-        // search_stack holds hashes of positions on the current search path.
-        // It starts populated with the real game history so repetitions against
-        // already-played positions are detected correctly.
         let mut search_stack = self.game_history.clone();
 
         for depth in 1..=max_depth {
@@ -74,6 +67,22 @@ impl Engine {
                 if !current_pv.is_empty() {
                     best = current_pv[0];
                     pv = current_pv;
+                }
+            }
+        }
+
+        // Fallback: if iterative deepening never produced a move (e.g. stopped before
+        // the first node was fully searched), return the first legal move so the game
+        // never freezes on a null result.
+        if best.is_null() {
+            for mv in MoveGen::generate(pos) {
+                let undo = make_move(pos, mv);
+                let them = 1 - pos.side as usize;
+                let legal = !MoveGen::is_attacked(pos, pos.king_sq[them], pos.side as usize);
+                unmake_move(pos, mv, undo);
+                if legal {
+                    best = mv;
+                    break;
                 }
             }
         }
@@ -98,19 +107,36 @@ impl Engine {
         deadline: Option<Instant>,
         search_stack: &mut Vec<u64>,
     ) -> i32 {
-        // Repetition detection: count how many times this position has occurred on the
-        // current path (including real game history loaded into search_stack). Two prior
-        // occurrences means this move would be the third — a draw by repetition.
         let current_hash = pos.hash;
-        let repetitions = search_stack.iter().filter(|&&h| h == current_hash).count();
-        if repetitions >= 2 {
-            return CONTEMPT;
+
+        // Draw detection: repetition — skip at ply=0 so the engine always
+        // returns a legal move from the root even in repeated positions.
+        if ply > 0 {
+            let repetitions = search_stack.iter().filter(|&&h| h == current_hash).count();
+            if repetitions >= 2 {
+                return CONTEMPT;
+            }
+        }
+
+        // Draw detection: fifty-move rule
+        if pos.halfmove_clock >= 100 {
+            return DRAW_SCORE;
         }
 
         if depth == 0 {
             return self.quiescence(pos, alpha, beta);
         }
 
+        // Transposition table probe
+        let (tt_score, tt_move) = self.tt.probe(current_hash, depth, alpha, beta, ply);
+        if let Some(score) = tt_score {
+            // Don't cut off at the root — we need a best_move to return.
+            if ply > 0 {
+                return score;
+            }
+        }
+
+        // Time check every 4096 nodes
         if self.nodes & 0xFFF == 0 {
             if self.stop.load(Ordering::Relaxed) { return 0; }
             if let Some(dl) = deadline {
@@ -123,16 +149,17 @@ impl Engine {
 
         self.nodes += 1;
 
+        let orig_alpha = alpha;
         let mut moves = MoveGen::generate(pos);
-        self.order_moves(pos, &mut moves, ply);
+        self.order_moves(pos, &mut moves, ply, tt_move);
 
         let mut legal = 0;
         let mut best_pv = Vec::new();
+        let mut best_move = Move::default();
 
         for mv in moves {
             let undo = make_move(pos, mv);
 
-            // Skip illegal moves (king left in check)
             let them = 1 - pos.side as usize;
             if MoveGen::is_attacked(pos, pos.king_sq[them], pos.side as usize) {
                 unmake_move(pos, mv, undo);
@@ -141,7 +168,6 @@ impl Engine {
 
             legal += 1;
 
-            // Push the pre-move hash so the child can detect repetition against this position
             search_stack.push(current_hash);
             let mut child_pv = Vec::new();
             let score = -self.negamax(pos, depth - 1, ply + 1, -beta, -alpha, &mut child_pv, deadline, search_stack);
@@ -159,29 +185,35 @@ impl Engine {
                     }
                 }
                 self.history[mv.from_sq() as usize][mv.to_sq() as usize] += (depth * depth) as i32;
+                self.tt.store(current_hash, depth, beta, TtFlag::Lower, mv, ply);
                 return beta;
             }
 
             if score > alpha {
                 alpha = score;
+                best_move = mv;
                 best_pv = child_pv;
                 best_pv.insert(0, mv);
             }
         }
 
         if legal == 0 {
-            if MoveGen::in_check(pos) {
-                return -(MATE_SCORE - ply as i32);
+            return if MoveGen::in_check(pos) {
+                -(MATE_SCORE - ply as i32)
             } else {
-                return DRAW_SCORE;
-            }
+                DRAW_SCORE
+            };
         }
+
+        let flag = if alpha > orig_alpha { TtFlag::Exact } else { TtFlag::Upper };
+        self.tt.store(current_hash, depth, alpha, flag, best_move, ply);
 
         *pv = best_pv;
         alpha
     }
 
     fn quiescence(&mut self, pos: &mut Position, mut alpha: i32, beta: i32) -> i32 {
+        if self.stop.load(Ordering::Relaxed) { return 0; }
         self.nodes += 1;
 
         let stand_pat = evaluate(pos);
@@ -208,10 +240,12 @@ impl Engine {
         alpha
     }
 
-    fn order_moves(&self, pos: &Position, moves: &mut Vec<Move>, ply: usize) {
+    fn order_moves(&self, pos: &Position, moves: &mut Vec<Move>, ply: usize, tt_move: Move) {
         moves.sort_by_key(|mv| {
             let mut score = 0i32;
-            if mv.is_capture() {
+            if !tt_move.is_null() && *mv == tt_move {
+                score += 20_000;
+            } else if mv.is_capture() {
                 score += 10_000 + mvv_lva(pos, *mv);
             } else if ply < 64 && (self.killers[ply][0] == *mv || self.killers[ply][1] == *mv) {
                 score += 9_000;

@@ -4,6 +4,9 @@ use std::thread;
 use egui::{Color32, Context, Key, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::board::position::{Color, Move, Piece, PieceType, Position};
+use crate::engine::book::get_book_move;
+use crate::engine::eval::is_insufficient_material;
+use crate::engine::polyglot::PolyglotBook;
 use crate::engine::{Engine, SearchResult};
 use crate::moves::generator::MoveGen;
 use crate::moves::make_move::make_move;
@@ -44,12 +47,37 @@ pub struct StockSharkApp {
     _human_color: Color,
     eval_score: Option<i32>,
     flip_board: bool,
+    /// Per-game seed for opening book variety.
+    game_seed: u64,
+    /// Loaded Polyglot .bin book, if any.
+    polyglot_book: Option<PolyglotBook>,
+    /// Path shown in the UI for book loading.
+    book_path_input: String,
+    book_status: String,
 }
 
 impl StockSharkApp {
     pub fn new(_cc: &eframe::CreationContext) -> Self {
         let pos = Position::startpos();
         let snapshots = vec![pos.clone()];
+        let seed = time_seed();
+
+        // Auto-load: try common names in order.
+        let candidates = ["Titans.bin", "titans.bin", "book.bin"];
+        let (default_path, polyglot_book, book_status) = candidates.iter()
+            .find_map(|&name| {
+                PolyglotBook::load(name).map(|b| (
+                    name.to_string(),
+                    Some(b),
+                    format!("Loaded: {}", name),
+                ))
+            })
+            .unwrap_or_else(|| (
+                "Titans.bin".to_string(),
+                None,
+                "No book found — drop Titans.bin here or use Load".to_string(),
+            ));
+
         Self {
             pos,
             position_snapshots: snapshots,
@@ -65,6 +93,10 @@ impl StockSharkApp {
             _human_color: Color::White,
             eval_score: None,
             flip_board: false,
+            game_seed: seed,
+            polyglot_book,
+            book_path_input: default_path,
+            book_status,
         }
     }
 
@@ -175,9 +207,61 @@ impl StockSharkApp {
             GameMode::EngineVsEngine => true,
             GameMode::HumanVsHuman   => false,
         };
-        if engine_turn && !self.engine_thinking {
+        if engine_turn && !self.engine_thinking && !self.try_book_move() {
             self.start_engine_search();
         }
+    }
+
+    /// Check the opening book and, if a move is available, queue it as an
+    /// instant engine result. Returns `true` when a book move was queued.
+    /// Priority: Polyglot file → internal hardcoded lines.
+    fn try_book_move(&mut self) -> bool {
+        // 1. Polyglot book (weight-proportional random selection for variety).
+        let poly_uci = if let Some(ref book) = self.polyglot_book {
+            let entries = book.probe(&self.pos);
+            if !entries.is_empty() {
+                // Pick randomly weighted by entry weight using the game seed.
+                let total: u32 = entries.iter().map(|e| e.weight as u32).sum();
+                let mut pick = (xorshift64(self.game_seed.wrapping_add(self.move_history.len() as u64))
+                    % total as u64) as u32;
+                let mut chosen = entries[0].uci.clone();
+                for e in &entries {
+                    if pick < e.weight as u32 { chosen = e.uci.clone(); break; }
+                    pick -= e.weight as u32;
+                }
+                Some(chosen)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 2. Fallback to internal hardcoded lines.
+        let uci_history: Vec<String> = self.move_history.iter().map(|(_, s)| s.clone()).collect();
+        let book_uci = poly_uci
+            .or_else(|| get_book_move(&uci_history, self.game_seed));
+
+        if let Some(uci) = book_uci {
+            if let Some(mv) = self.find_legal_move_by_uci(&uci) {
+                self.engine_thinking = true;
+                self.status = "Book...".to_string();
+                *self.engine_result.lock().unwrap() = Some(SearchResult {
+                    best_move: mv,
+                    score: 0,
+                    depth: 0,
+                    nodes: 0,
+                    pv: vec![mv],
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_legal_move_by_uci(&self, uci: &str) -> Option<Move> {
+        let moves = crate::moves::generator::MoveGen::generate(&self.pos);
+        moves.into_iter().find(|mv| mv.to_uci() == uci && self.is_legal(mv))
     }
 
     fn start_engine_search(&mut self) {
@@ -187,7 +271,13 @@ impl StockSharkApp {
         let mut pos = self.pos.clone();
         let depth = self.engine_depth;
         let result_ref = self.engine_result.clone();
-        let history: Vec<u64> = self.position_snapshots.iter().map(|p| p.hash).collect();
+        // Exclude the current position so the repetition check in negamax doesn't
+        // false-trigger at the root and return a null move (causing a freeze).
+        let n = self.position_snapshots.len();
+        let history: Vec<u64> = self.position_snapshots[..n.saturating_sub(1)]
+            .iter()
+            .map(|p| p.hash)
+            .collect();
 
         thread::spawn(move || {
             let mut engine = Engine::new();
@@ -205,6 +295,8 @@ impl StockSharkApp {
             self.engine_thinking = false;
             if !r.best_move.is_null() {
                 self.apply_move(r.best_move);
+            } else {
+                self.update_status();
             }
         }
     }
@@ -220,6 +312,10 @@ impl StockSharkApp {
     }
 
     fn is_game_over(&mut self) -> bool {
+        if is_insufficient_material(&self.pos) {
+            self.status = "Draw by insufficient material.".to_string();
+            return true;
+        }
         let moves = MoveGen::generate(&self.pos);
         let has_legal = moves.iter().any(|mv| self.is_legal(mv));
         if !has_legal {
@@ -247,6 +343,7 @@ impl StockSharkApp {
         self.move_history.clear();
         self.engine_thinking = false;
         self.eval_score = None;
+        self.game_seed = time_seed();
         *self.engine_result.lock().unwrap() = None;
         self.update_status();
         self.maybe_trigger_engine();
@@ -422,6 +519,34 @@ impl eframe::App for StockSharkApp {
                     self.flip_board = !self.flip_board;
                 }
             });
+            // ── Opening book loader ──────────────────────────────────────────
+            ui.horizontal(|ui| {
+                let book_indicator = if self.polyglot_book.is_some() { "📖" } else { "—" };
+                ui.label(format!("Book {}", book_indicator));
+                ui.add(egui::TextEdit::singleline(&mut self.book_path_input).desired_width(220.0));
+                if ui.button("Load").clicked() {
+                    let path = self.book_path_input.clone();
+                    match PolyglotBook::load(&path) {
+                        Some(b) => {
+                            self.polyglot_book = Some(b);
+                            self.book_status = format!("Loaded: {}", path);
+                        }
+                        None => {
+                            self.book_status = format!("Failed to load: {}", path);
+                        }
+                    }
+                }
+                if ui.button("Clear").clicked() {
+                    self.polyglot_book = None;
+                    self.book_status = "No book loaded".to_string();
+                }
+                ui.label(egui::RichText::new(&self.book_status)
+                    .color(if self.polyglot_book.is_some() {
+                        Color32::from_rgb(100, 200, 100)
+                    } else {
+                        Color32::GRAY
+                    }));
+            });
         });
 
         // ── Move list (right panel) ──────────────────────────────────────────
@@ -519,6 +644,21 @@ impl eframe::App for StockSharkApp {
             });
         });
     }
+}
+
+fn xorshift64(mut x: u64) -> u64 {
+    if x == 0 { x = 0x9e3779b97f4a7c15; }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
+}
+
+fn time_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e3779b97f4a7c15)
 }
 
 fn piece_glyph(piece: Piece) -> &'static str {
