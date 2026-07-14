@@ -108,32 +108,43 @@ fn parse_uci_move(pos: &Position, s: &str) -> Option<Move> {
 }
 
 fn parse_go(tokens: &[&str], side: Color) -> (u32, Option<u64>) {
-    let mut depth = 6u32;
+    let mut depth: Option<u32> = None;
     let mut movetime: Option<u64> = None;
     let mut wtime: Option<u64> = None;
     let mut btime: Option<u64> = None;
+    let mut winc: u64 = 0;
+    let mut binc: u64 = 0;
 
     let mut i = 1;
     while i < tokens.len() {
         match tokens[i] {
-            "depth"    => { i += 1; depth = tokens.get(i).and_then(|t| t.parse().ok()).unwrap_or(6); }
+            "depth"    => { i += 1; depth = tokens.get(i).and_then(|t| t.parse().ok()); }
             "movetime" => { i += 1; movetime = tokens.get(i).and_then(|t| t.parse().ok()); }
             "wtime"    => { i += 1; wtime = tokens.get(i).and_then(|t| t.parse().ok()); }
             "btime"    => { i += 1; btime = tokens.get(i).and_then(|t| t.parse().ok()); }
+            "winc"     => { i += 1; winc = tokens.get(i).and_then(|t| t.parse().ok()).unwrap_or(0); }
+            "binc"     => { i += 1; binc = tokens.get(i).and_then(|t| t.parse().ok()).unwrap_or(0); }
             _ => {}
         }
         i += 1;
     }
 
     let time_ms = movetime.or_else(|| {
-        let t = match side {
-            Color::White => wtime,
-            Color::Black => btime,
+        let (remaining, inc) = match side {
+            Color::White => (wtime, winc),
+            Color::Black => (btime, binc),
         };
-        t.map(|ms| ms / 30)
+        // Allot ~1/25 of the remaining time plus most of the increment. This
+        // uses the clock far better than a flat remaining/30 while staying safe.
+        remaining.map(|ms| ms / 25 + (inc * 3) / 4)
     });
 
-    (depth, time_ms)
+    // With a time control present, let iterative deepening run as deep as the
+    // clock allows (capped high for safety). Only hard-cap by depth when the
+    // GUI explicitly asked for a fixed depth.
+    let max_depth = depth.unwrap_or(if time_ms.is_some() { 64 } else { 6 });
+
+    (max_depth, time_ms)
 }
 
 fn print_board(pos: &Position) {

@@ -181,6 +181,38 @@ pub fn unmake_move(pos: &mut Position, mv: Move, undo: Undo) {
     }
 }
 
+/// Make a "null move": pass the turn to the opponent without moving. Used by
+/// null-move pruning. Only legal to call when the side to move is NOT in check.
+pub fn make_null_move(pos: &mut Position) -> Undo {
+    let undo = Undo {
+        castling: pos.castling,
+        ep_sq: pos.ep_sq,
+        halfmove_clock: pos.halfmove_clock,
+        hash: pos.hash,
+        captured: None,
+    };
+
+    // Clear en-passant (a pass cannot be followed by an ep capture).
+    if pos.ep_sq != 255 {
+        pos.hash ^= zobrist::ep_key(pos.ep_sq % 8);
+        pos.ep_sq = 255;
+    }
+
+    pos.halfmove_clock += 1;
+    pos.side = pos.side.flip();
+    pos.hash ^= zobrist::side_key();
+
+    undo
+}
+
+pub fn unmake_null_move(pos: &mut Position, undo: Undo) {
+    pos.side = pos.side.flip();
+    pos.castling = undo.castling;
+    pos.ep_sq = undo.ep_sq;
+    pos.halfmove_clock = undo.halfmove_clock;
+    pos.hash = undo.hash;
+}
+
 fn move_piece(pos: &mut Position, from: u8, to: u8, us: usize) {
     if let Some(piece) = pos.board[from as usize] {
         pos.pieces[piece.bb_index()].clear(from);
