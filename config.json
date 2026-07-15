@@ -32,7 +32,7 @@
         "additional_lines_rgx": [],
         "event_name": "Fastchess Tournament",
         "site": "?",
-        "file": "/Users/tomheddle/dev/StockShark/testing/results/games_20260714_122111_sf2450.pgn",
+        "file": "/Users/tomheddle/dev/StockShark/testing/results/games_20260715_152232_sf2600.pgn",
         "notation": 0,
         "append_file": true,
         "track_nodes": false,
@@ -60,7 +60,7 @@
     },
     "config_name": "config.json",
     "output": 0,
-    "seed": 776931584364163842,
+    "seed": 18254581598645081895,
     "variant": 0,
     "type": 0,
     "gauntlet_seeds": 1,
@@ -109,7 +109,7 @@
             "variant": 0
         },
         {
-            "name": "SF2450",
+            "name": "SF2600",
             "dir": "",
             "cmd": "/opt/homebrew/bin/stockfish",
             "args": "",
@@ -121,7 +121,7 @@
                 ],
                 [
                     "UCI_Elo",
-                    "2450"
+                    "2600"
                 ]
             ],
             "limit": {
@@ -139,16 +139,16 @@
         }
     ],
     "stats": {
-        "StockShark vs SF2450": {
-            "wins": 46,
-            "losses": 65,
-            "draws": 9,
-            "penta_WW": 9,
-            "penta_WD": 3,
+        "StockShark vs SF2600": {
+            "wins": 35,
+            "losses": 74,
+            "draws": 11,
+            "penta_WW": 5,
+            "penta_WD": 0,
             "penta_WL": 25,
-            "penta_DD": 0,
-            "penta_LD": 6,
-            "penta_LL": 17
+            "penta_DD": 1,
+            "penta_LD": 9,
+            "penta_LL": 20
         }
     }
 }

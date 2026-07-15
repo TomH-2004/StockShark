@@ -67,8 +67,9 @@ impl Engine {
 
             let mut current_pv = Vec::new();
             let score;
-            if depth <= 4 {
-                // Shallow depths are cheap; search the full window for a solid seed.
+            if depth <= 4 || best_score.abs() >= MATE_SCORE - 1000 {
+                // Shallow depths are cheap, and near mate the window is meaningless;
+                // search the full window for a solid, guaranteed-terminating result.
                 score = self.negamax(pos, depth, 0, -MATE_SCORE, MATE_SCORE, &mut current_pv, deadline, &mut search_stack, true);
             } else {
                 // Aspiration window: assume the score is near the previous depth's
@@ -81,11 +82,15 @@ impl Engine {
                     let s = self.negamax(pos, depth, 0, alpha, beta, &mut current_pv, deadline, &mut search_stack, true);
                     if self.stop.load(Ordering::Relaxed) { score = s; break; }
                     if s <= alpha {
-                        // Fail low: relax alpha downward, nudge beta toward it for stability.
+                        // Fail low. If the window is already fully open we can't
+                        // relax further (e.g. a discovered mate pins alpha at the
+                        // floor) — accept the score to guarantee termination.
+                        if alpha <= -MATE_SCORE + 1 { score = s; break; }
                         beta = (alpha + beta) / 2;
                         alpha = (s - delta).max(-MATE_SCORE);
                     } else if s >= beta {
-                        // Fail high: relax beta upward.
+                        // Fail high; likewise bail once beta is fully open.
+                        if beta >= MATE_SCORE - 1 { score = s; break; }
                         beta = (s + delta).min(MATE_SCORE);
                     } else {
                         score = s;
@@ -194,6 +199,17 @@ impl Engine {
 
         self.nodes += 1;
 
+        // Static evaluation of this node (only meaningful when not in check),
+        // used by the whole-node and per-move pruning heuristics below.
+        let static_eval = if in_check { -MATE_SCORE } else { evaluate(pos) };
+        let prunable = !is_pv && !in_check && beta.abs() < MATE_SCORE - 1000;
+
+        // Reverse futility pruning (static null move): if the static eval already
+        // beats beta by a wide, depth-scaled margin, assume it will hold up and cut.
+        if prunable && depth <= 6 && static_eval - 85 * depth as i32 >= beta {
+            return static_eval - 85 * depth as i32;
+        }
+
         // Null-move pruning: hand the opponent a free move; if we're still above
         // beta after a shallow search, this node is almost certainly a cutoff.
         // Skipped in check, in PV nodes, near mate scores, and when the side to
@@ -240,6 +256,25 @@ impl Engine {
 
             legal += 1;
 
+            let is_quiet = !mv.is_capture() && !mv.is_promotion();
+
+            // Move-level pruning of late quiet moves, once at least one move has
+            // been fully searched (legal >= 2) so a best move is guaranteed.
+            if prunable && is_quiet && legal >= 2 && alpha.abs() < MATE_SCORE - 1000 {
+                // Late move pruning: after enough quiet tries at shallow depth,
+                // skip the remaining (well-ordered, unlikely) quiet moves.
+                if depth <= 6 && legal as u32 > 3 + depth * depth {
+                    unmake_move(pos, mv, undo);
+                    continue;
+                }
+                // Futility pruning: near the leaf, a quiet move that can't lift a
+                // margin-boosted static eval to alpha is almost certainly useless.
+                if depth <= 3 && static_eval + 90 * depth as i32 + 100 <= alpha {
+                    unmake_move(pos, mv, undo);
+                    continue;
+                }
+            }
+
             search_stack.push(current_hash);
             let mut child_pv = Vec::new();
             let new_depth = depth - 1;
@@ -250,13 +285,17 @@ impl Engine {
             } else {
                 // Late move reduction: quiet moves ordered late are searched
                 // shallower first, then re-searched at full depth only if they
-                // look like they might beat alpha.
+                // look like they might beat alpha. Reduction grows with depth and
+                // move count (log formula), eased for PV nodes and killer moves.
                 let mut reduction = 0u32;
-                if depth >= 3 && legal > 3 && !mv.is_capture() && !mv.is_promotion() && !in_check {
-                    reduction = 1;
-                    if legal > 6 { reduction += 1; }
-                    if !is_pv { reduction += 1; }
-                    reduction = reduction.min(new_depth);
+                if depth >= 3 && legal > 3 && is_quiet && !in_check {
+                    let r = 0.5 + (depth as f64).ln() * (legal as f64).ln() / 2.5;
+                    reduction = (r as u32).max(1);
+                    if is_pv { reduction = reduction.saturating_sub(1); }
+                    if ply < 64 && (self.killers[ply][0] == mv || self.killers[ply][1] == mv) {
+                        reduction = reduction.saturating_sub(1);
+                    }
+                    reduction = reduction.min(new_depth.saturating_sub(1));
                 }
 
                 // Principal variation search: zero-window probe first.
